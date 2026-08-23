@@ -1,0 +1,130 @@
+name: Build iOS
+
+# Personal sideloading build.
+# Produces an UNSIGNED, re-signable IPA for signing with a free Apple ID
+# (Sideloadly / AltStore). No App Store, TestFlight, or paid certificates.
+
+on:
+  workflow_dispatch:
+    inputs:
+      xcode_version:
+        description: "Xcode version on the runner (16.2 matches upstream Spotube releases)"
+        required: false
+        default: "16.2"
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    timeout-minutes: 90
+
+    env:
+      FLUTTER_VERSION: "3.35.2"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Diagnostic: if the pinned Xcode is missing from the runner image, this
+      # list tells you which version to put in the workflow_dispatch input.
+      - name: List available Xcode versions
+        run: ls /Applications | grep -i '^Xcode' || true
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ github.event.inputs.xcode_version || '16.2' }}
+
+      - name: Setup Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      # metadata_god / irondash / super_native_extensions build Rust code and
+      # need the iOS device target. Without this the iOS compile fails.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add Rust iOS target
+        run: rustup target add aarch64-apple-ios
+
+      - name: Print toolchain versions
+        run: |
+          flutter --version
+          dart --version
+          xcodebuild -version
+          pod --version
+          rustc --version
+
+      # envied is configured with requireEnvFile: true, and LASTFM_API_KEY /
+      # LASTFM_API_SECRET have no defaultValue, so .env must exist for codegen.
+      # Empty values are fine: they only disable Last.fm scrobbling.
+      - name: Create .env
+        run: |
+          cat > .env <<'ENVEOF'
+          ENABLE_UPDATE_CHECK=0
+          LASTFM_API_KEY=
+          LASTFM_API_SECRET=
+          RELEASE_CHANNEL=stable
+          HIDE_DONATIONS=0
+          ENVEOF
+          echo "--- .env ---"
+          cat .env
+
+      - name: flutter pub get
+        run: flutter pub get
+
+      - name: Code generation
+        run: dart run build_runner build --delete-conflicting-outputs
+
+      - name: Install CocoaPods dependencies
+        working-directory: ios
+        run: pod install --repo-update
+
+      - name: Build iOS (release, physical device, unsigned)
+        run: flutter build ios --release --no-codesign
+
+      - name: Verify Runner.app exists
+        run: |
+          APP="build/ios/iphoneos/Runner.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::$APP not found"
+            ls -la build/ios/ || true
+            exit 1
+          fi
+          echo "Found $APP"
+          ls -la "$APP"
+
+      - name: Verify physical-device arm64 binary (not simulator)
+        run: |
+          BIN="build/ios/iphoneos/Runner.app/Runner"
+          echo "--- architectures ---"
+          lipo -info "$BIN"
+          lipo -info "$BIN" | grep -q "arm64" || { echo "::error::Runner is not arm64"; exit 1; }
+
+          echo "--- platform ---"
+          vtool -show-build "$BIN" || true
+          if vtool -show-build "$BIN" 2>/dev/null | grep -qi "IOSSIMULATOR"; then
+            echo "::error::Runner was built for the iOS Simulator, not a physical device"
+            exit 1
+          fi
+          echo "OK: arm64 physical-device build"
+
+      - name: Package unsigned IPA
+        run: |
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qry Spotube-iPhone17-unsigned.ipa Payload
+          echo "--- ipa ---"
+          ls -lh Spotube-iPhone17-unsigned.ipa
+          unzip -l Spotube-iPhone17-unsigned.ipa | head -20
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Spotube-iPhone17
+          path: Spotube-iPhone17-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
