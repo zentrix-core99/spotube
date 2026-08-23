@@ -8,13 +8,13 @@ on:
   workflow_dispatch:
     inputs:
       xcode_version:
-        description: "Xcode version on the runner (16.2 matches upstream Spotube releases)"
+        description: "Xcode version (macos-15 provides 16.0-16.4; 16.2 matches upstream Spotube)"
         required: false
         default: "16.2"
 
 jobs:
   build-ios:
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 90
 
     env:
